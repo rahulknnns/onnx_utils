@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ONNX Quantization Editor (AIMET - Int Only)</title>
+    
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- D3.js for Rendering -->
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    
+    <!-- Dagre for Layout (CDN) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js"></script>
+    
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f3f4f6; }
+        .canvas-container { width: 100%; height: 100%; overflow: hidden; background: #e5e7eb; cursor: grab; }
+        .canvas-container:active { cursor: grabbing; }
+        
+        /* Node Styles */
+        .node rect { 
+            stroke: #fff; 
+            stroke-width: 0.5px; 
+            transition: stroke-width 0.2s; 
+            filter: drop-shadow(0 4px 3px rgb(0 0 0 / 0.15));
+        }
+        .node:hover rect { stroke: #fff; stroke-width: 3px; }
+        .node.selected rect { stroke: #000; stroke-width: 3px; }
+        
+        .node-title { font-size: 11px; font-weight: 600; fill: #ffffff; pointer-events: none; text-shadow: 0 1px 2px rgba(0,0,0,0.3); }
+        .node-type { font-size: 9px; font-weight: 400; fill: #e5e7eb; pointer-events: none; opacity: 0.9; }
+        
+        /* Edge Styles */
+        .edge-path { 
+            fill: none; 
+            stroke: #9ca3af; 
+            stroke-width: 1.5px; 
+        }
+
+        /* Edge Labels */
+        .edge-label {
+            font-size: 9px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            fill: #4b5563; /* Gray-600 */
+            text-anchor: middle;
+            font-weight: 500;
+            /* Halo effect for readability over lines */
+            paint-order: stroke;
+            stroke: #e5e7eb; /* Matches canvas bg */
+            stroke-width: 4px;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+            pointer-events: none;
+        }
+        
+        /* Scrollbars */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #c1c1c1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #a8a8a8; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useMemo } = React;
+
+        // --- D3 + Dagre Graph Component ---
+        const GraphVisualizer = ({ data, encodings, selectedNodes, onNodeClick, defaultBitwidth, focusedNode }) => {
+            const svgRef = useRef(null);
+            const wrapperRef = useRef(null);
+            const zoomRef = useRef(null);
+            const graphRef = useRef(null); // Store layout for zoom-to-node
+            const initialTransformRef = useRef(d3.zoomIdentity);
+            
+            const onNodeClickRef = useRef(onNodeClick);
+            useEffect(() => {
+                onNodeClickRef.current = onNodeClick;
+            }, [onNodeClick]);
+            
+            // Constants for Node Dimensions
+            const NODE_WIDTH = 180;
+            const NODE_HEIGHT = 50;
+
+            // --- Netron-like Color Palette ---
+            const getOpColor = (type) => {
+                const t = (type || '').toLowerCase();
+                if (t.includes('conv') || t.includes('gemm') || t.includes('matmul') || t.includes('linear')) return '#3273dc';
+                if (t.includes('relu') || t.includes('sigmoid') || t.includes('tanh') || t.includes('activation')) return '#ee3f4d';
+                if (t.includes('pool')) return '#23d160';
+                if (t.includes('norm')) return '#7957d5';
+                if (t.includes('concat') || t.includes('reshape') || t.includes('transpose') || t.includes('flatten') || t.includes('squeeze') || t.includes('unsqueeze')) return '#363636';
+                if (t.includes('add') || t.includes('sub') || t.includes('mul') || t.includes('div')) return '#555555';
+                if (t === 'input' || t === 'output') return '#000000';
+                return '#777777'; 
+            };
+
+            // --- Quantization Status Color ---
+            const getQuantColor = (node) => {
+                const outputTensor = node.outputs && node.outputs.length > 0 ? node.outputs[0] : null;
+                if (!outputTensor) return '#777';
+
+                const encoding = encodings[outputTensor];
+                let bitwidth = defaultBitwidth;
+
+                if (encoding) {
+                    if (Array.isArray(encoding) && encoding.length > 0) {
+                        bitwidth = encoding[0].bitwidth;
+                    }
+                }
+
+                if (bitwidth === 16) return '#3b82f6';
+                if (bitwidth === 32) return '#d1d5db';
+                return '#22c55e';
+            };
+
+            const fitView = () => {
+                 if (!svgRef.current || !zoomRef.current) return;
+                 const svg = d3.select(svgRef.current);
+                 svg.transition().duration(750).call(zoomRef.current.transform, initialTransformRef.current);
+            };
+
+            // --- Focus Node Effect ---
+            useEffect(() => {
+                if (!focusedNode || !graphRef.current || !svgRef.current || !zoomRef.current) return;
+                
+                const g = graphRef.current;
+                const nodeData = g.node(focusedNode.id); // Access layout data directly
+                
+                if (nodeData) {
+                    const svg = d3.select(svgRef.current);
+                    const wrapperWidth = wrapperRef.current.clientWidth;
+                    const wrapperHeight = wrapperRef.current.clientHeight;
+                    
+                    // Keep current scale if possible, but clamp it to reasonable visible range
+                    const currentTransform = d3.zoomTransform(svg.node());
+                    let scale = currentTransform.k;
+                    if (scale < 0.5) scale = 0.8; // Zoom in if too far out
+                    if (scale > 2) scale = 2;     // Zoom out if too close
+
+                    const tx = (wrapperWidth / 2) - (nodeData.x * scale);
+                    const ty = (wrapperHeight / 2) - (nodeData.y * scale);
+                    
+                    const newTransform = d3.zoomIdentity.translate(tx, ty).scale(scale);
+                    
+                    svg.transition()
+                        .duration(750)
+                        .call(zoomRef.current.transform, newTransform);
+                }
+            }, [focusedNode]); // Triggers when the object reference changes (timestamp updated in App)
+
+            useEffect(() => {
+                if (!data.nodes.length) return;
+
+                const width = wrapperRef.current.clientWidth;
+                const height = wrapperRef.current.clientHeight;
+
+                // 1. Setup Dagre Graph
+                const g = new dagre.graphlib.Graph();
+                g.setGraph({ 
+                    rankdir: 'TB', 
+                    nodesep: 60, 
+                    ranksep: 80, 
+                    marginx: 40,
+                    marginy: 40
+                });
+                g.setDefaultEdgeLabel(() => ({}));
+
+                // 2. Add Nodes
+                data.nodes.forEach(node => {
+                    g.setNode(node.id, { 
+                        label: node.id, 
+                        width: NODE_WIDTH, 
+                        height: NODE_HEIGHT,
+                        type: node.type,
+                        originalNode: node 
+                    });
+                });
+
+                // 3. Add Edges
+                data.edges.forEach(edge => {
+                    g.setEdge(edge.source, edge.target);
+                });
+
+                // 4. Compute Layout
+                dagre.layout(g);
+                graphRef.current = g; // Store for focus logic
+
+                // 5. Render
+                d3.select(svgRef.current).selectAll("*").remove();
+
+                const svg = d3.select(svgRef.current)
+                    .attr("viewBox", [0, 0, width, height]);
+
+                const container = svg.append("g");
+
+                const zoom = d3.zoom()
+                    .scaleExtent([0.1, 3])
+                    .on("zoom", (event) => container.attr("transform", event.transform));
+                
+                zoomRef.current = zoom;
+                svg.call(zoom);
+                
+                // Smart Centering
+                let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+                g.nodes().forEach(v => {
+                    const node = g.node(v);
+                    minX = Math.min(minX, node.x - node.width / 2);
+                    maxX = Math.max(maxX, node.x + node.width / 2);
+                    minY = Math.min(minY, node.y - node.height / 2);
+                    maxY = Math.max(maxY, node.y + node.height / 2);
+                });
+
+                if (minX === Infinity) { minX = 0; maxX = 100; minY = 0; maxY = 100; }
+
+                const padding = 50; 
+                const graphW = maxX - minX + padding * 2;
+                const graphH = maxY - minY + padding * 2;
+                const midX = (minX + maxX) / 2;
+                const midY = (minY + maxY) / 2;
+
+                const scaleX = width / graphW;
+                const scaleY = height / graphH;
+                let scale = Math.min(scaleX, scaleY);
+                scale = Math.min(scale, 1); 
+                if (scale < 0.4) scale = 0.4; 
+
+                let tx = (width / 2) - (midX * scale);
+                let ty = (height / 2) - (midY * scale);
+                if (scale === 0.4 && graphH * scale > height) ty = 50;
+
+                const transform = d3.zoomIdentity.translate(tx, ty).scale(scale);
+                initialTransformRef.current = transform;
+                svg.call(zoom.transform, transform);
+
+                // Arrows
+                container.append("defs").selectAll("marker")
+                    .data(["end"])
+                    .enter().append("marker")
+                    .attr("id", "arrow")
+                    .attr("viewBox", "0 -5 10 10")
+                    .attr("refX", 8) 
+                    .attr("refY", 0)
+                    .attr("markerWidth", 6)
+                    .attr("markerHeight", 6)
+                    .attr("orient", "auto")
+                    .append("path")
+                    .attr("d", "M0,-5L10,0L0,5")
+                    .attr("fill", "#9ca3af");
+
+                // Edges
+                const line = d3.line()
+                    .curve(d3.curveBasis)
+                    .x(d => d.x)
+                    .y(d => d.y);
+
+                container.append("g")
+                    .selectAll("path")
+                    .data(g.edges())
+                    .enter().append("path")
+                    .attr("class", "edge-path")
+                    .attr("marker-end", "url(#arrow)")
+                    .attr("d", e => line(g.edge(e).points));
+
+                // Edge Labels
+                container.append("g")
+                    .selectAll("text")
+                    .data(g.edges())
+                    .enter().append("text")
+                    .attr("class", "edge-label")
+                    .attr("x", e => g.edge(e).points[Math.floor(g.edge(e).points.length / 2)].x)
+                    .attr("y", e => g.edge(e).points[Math.floor(g.edge(e).points.length / 2)].y)
+                    .text(e => {
+                        const srcNode = data.nodes.find(n => n.id === e.v);
+                        const tgtNode = data.nodes.find(n => n.id === e.w);
+                        if (!srcNode || !tgtNode) return "";
+                        const shared = srcNode.outputs.find(out => tgtNode.inputs.includes(out));
+                        return shared && shared.length > 20 ? shared.substring(0, 18) + '..' : shared;
+                    });
+
+                // Nodes
+                const nodes = container.append("g")
+                    .selectAll("g")
+                    .data(g.nodes())
+                    .enter().append("g")
+                    .attr("class", "node")
+                    .attr("transform", v => {
+                        const node = g.node(v);
+                        return `translate(${node.x - node.width / 2},${node.y - node.height / 2})`;
+                    })
+                    .on("click", (event, v) => {
+                        event.stopPropagation();
+                        onNodeClickRef.current(v, event);
+                    });
+
+                nodes.append("rect")
+                    .attr("width", NODE_WIDTH)
+                    .attr("height", NODE_HEIGHT)
+                    .attr("rx", 8)
+                    .attr("ry", 8)
+                    .attr("fill", v => getOpColor(g.node(v).type))
+                    .attr("id", v => `rect-${v.replace(/[^a-zA-Z0-9-_]/g, '')}`);
+
+                nodes.append("text")
+                    .attr("class", "node-title")
+                    .attr("x", 12)
+                    .attr("y", 20)
+                    .text(v => v.length > 22 ? v.substring(0, 20) + '...' : v);
+
+                nodes.append("text")
+                    .attr("class", "node-type")
+                    .attr("x", 12)
+                    .attr("y", 36)
+                    .text(v => g.node(v).type.toUpperCase());
+
+                nodes.append("circle")
+                    .attr("cx", NODE_WIDTH - 15)
+                    .attr("cy", NODE_HEIGHT / 2)
+                    .attr("r", 5)
+                    .attr("stroke", "#fff")
+                    .attr("stroke-width", 1.5)
+                    .attr("id", v => `status-${v.replace(/[^a-zA-Z0-9-_]/g, '')}`)
+                    .attr("fill", v => getQuantColor(g.node(v).originalNode));
+
+            }, [data]);
+
+            // --- Updates ---
+            useEffect(() => {
+                if (!data.nodes.length) return;
+                const svg = d3.select(svgRef.current);
+                
+                data.nodes.forEach(n => {
+                    const cleanId = n.id.replace(/[^a-zA-Z0-9-_]/g, '');
+                    svg.select(`#status-${cleanId}`).attr("fill", getQuantColor(n));
+                });
+                
+                svg.selectAll(".node").classed("selected", false);
+                selectedNodes.forEach(id => {
+                     svg.selectAll(".node").filter(d => d === id).classed("selected", true);
+                });
+            }, [encodings, selectedNodes, defaultBitwidth]);
+
+            return (
+                <div ref={wrapperRef} className="canvas-container relative">
+                    <svg ref={svgRef} width="100%" height="100%"></svg>
+                    {data.nodes.length > 0 && (
+                        <button 
+                            onClick={fitView}
+                            className="absolute bottom-4 right-4 bg-white hover:bg-gray-50 text-gray-700 p-2 rounded shadow border border-gray-200"
+                            title="Fit View"
+                        >
+                            <i data-lucide="scan-search"></i>
+                        </button>
+                    )}
+                </div>
+            );
+        };
+
+        // --- Main App Component ---
+        const App = () => {
+            const [graphData, setGraphData] = useState({ nodes: [], edges: [] });
+            const [encodings, setEncodings] = useState({});
+            const [defaultBitwidth, setDefaultBitwidth] = useState(8);
+            const [selectedNodes, setSelectedNodes] = useState(new Set());
+            const [lastSelectedId, setLastSelectedId] = useState(null);
+            const [focusedNode, setFocusedNode] = useState(null); // { id: string, t: number }
+            const [searchTerm, setSearchTerm] = useState("");
+            
+            useEffect(() => {
+                lucide.createIcons();
+            });
+
+            const getActivationName = (nodeId) => {
+                const node = graphData.nodes.find(n => n.id === nodeId);
+                if (node && node.outputs && node.outputs.length > 0) {
+                    return node.outputs[0];
+                }
+                return null;
+            };
+
+            const handleStructureUpload = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = (ev) => {
+                    setGraphData(JSON.parse(ev.target.result));
+                    setLastSelectedId(null);
+                    setSelectedNodes(new Set());
+                };
+                reader.readAsText(file);
+            };
+
+            const handleEncodingsUpload = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = (ev) => {
+                    const json = JSON.parse(ev.target.result);
+                    if (json.activation_encodings) {
+                        setEncodings(json.activation_encodings);
+                    } else {
+                        setEncodings(json);
+                    }
+                };
+                reader.readAsText(file);
+            };
+
+            // Unified click handler
+            const handleNodeClick = (nodeId, event) => {
+                const { shiftKey, ctrlKey, metaKey } = event;
+                const isCtrl = ctrlKey || metaKey;
+                const isShift = shiftKey;
+                let newSet = new Set(selectedNodes);
+
+                if (!isCtrl && !isShift) {
+                    newSet.clear();
+                    newSet.add(nodeId);
+                    setLastSelectedId(nodeId);
+                } 
+                else if (isShift && lastSelectedId) {
+                    const nodes = graphData.nodes;
+                    const idx1 = nodes.findIndex(n => n.id === lastSelectedId);
+                    const idx2 = nodes.findIndex(n => n.id === nodeId);
+                    if (idx1 !== -1 && idx2 !== -1) {
+                        const start = Math.min(idx1, idx2);
+                        const end = Math.max(idx1, idx2);
+                        for (let i = start; i <= end; i++) newSet.add(nodes[i].id);
+                    }
+                } 
+                else if (isCtrl) {
+                    if (newSet.has(nodeId)) newSet.delete(nodeId);
+                    else newSet.add(nodeId);
+                    setLastSelectedId(nodeId);
+                } else {
+                     newSet.add(nodeId);
+                     setLastSelectedId(nodeId);
+                }
+                setSelectedNodes(newSet);
+            };
+
+            // Triggered when clicking list item
+            const handleListClick = (nodeId, event) => {
+                handleNodeClick(nodeId, event);
+                // Trigger focus (pan/zoom) on list click.
+                // We use a timestamp to ensure clicking the same node again re-centers it.
+                setFocusedNode({ id: nodeId, t: Date.now() });
+            };
+
+            const selectByType = (typeFragment) => {
+                const newSet = new Set(selectedNodes);
+                graphData.nodes.forEach(n => {
+                    if ((n.type || '').toLowerCase().includes(typeFragment.toLowerCase())) newSet.add(n.id);
+                });
+                setSelectedNodes(newSet);
+            };
+            
+            const clearSelection = () => {
+                setSelectedNodes(new Set());
+                setLastSelectedId(null);
+            };
+
+            const applyEncoding = (bitwidth) => {
+                const newEncodings = { ...encodings };
+                selectedNodes.forEach(nodeId => {
+                    const activation = getActivationName(nodeId);
+                    if (activation) {
+                        newEncodings[activation] = [{
+                            bitwidth: bitwidth,
+                            dtype: 'int',
+                            is_symmetric: false 
+                        }];
+                    }
+                });
+                setEncodings(newEncodings);
+            };
+
+            const downloadEncodings = () => {
+                const aimetStructure = {
+                    activation_encodings: encodings,
+                    param_encodings: {} 
+                };
+                const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(aimetStructure, null, 2));
+                const downloadAnchorNode = document.createElement('a');
+                downloadAnchorNode.setAttribute("href", dataStr);
+                downloadAnchorNode.setAttribute("download", "aimet_encodings.json");
+                document.body.appendChild(downloadAnchorNode);
+                downloadAnchorNode.click();
+                downloadAnchorNode.remove();
+            };
+
+            const stats = useMemo(() => {
+                const counts = { int8: 0, int16: 0, int32: 0, total: graphData.nodes.length };
+                graphData.nodes.forEach(node => {
+                    const activation = getActivationName(node.id);
+                    let bitwidth = defaultBitwidth;
+                    if (activation && encodings[activation]) {
+                        const enc = encodings[activation];
+                         if (Array.isArray(enc) && enc.length > 0) bitwidth = enc[0].bitwidth;
+                    }
+                    if (bitwidth === 16) counts.int16++;
+                    else if (bitwidth === 32) counts.int32++;
+                    else counts.int8++;
+                });
+                return counts;
+            }, [encodings, graphData, defaultBitwidth]);
+
+            const filteredNodes = graphData.nodes.filter(n => 
+                n.id.toLowerCase().includes(searchTerm.toLowerCase()) || 
+                (n.type || '').toLowerCase().includes(searchTerm.toLowerCase())
+            );
+
+            const getEncodingLabel = (nodeId) => {
+                const act = getActivationName(nodeId);
+                let bitwidth = defaultBitwidth;
+                let isDef = true;
+                if (act && encodings[act]) {
+                    bitwidth = encodings[act][0].bitwidth;
+                    isDef = false;
+                }
+                return `int${bitwidth}${isDef ? ' (def)' : ''}`;
+            };
+            
+            const getEncodingColorClass = (nodeId) => {
+                const act = getActivationName(nodeId);
+                let bitwidth = defaultBitwidth;
+                if (act && encodings[act]) bitwidth = encodings[act][0].bitwidth;
+                if (bitwidth === 16) return "bg-blue-500";
+                if (bitwidth === 32) return "bg-gray-300";
+                return "bg-green-500";
+            };
+
+            return (
+                <div className="flex h-screen w-full overflow-hidden">
+                    {/* Sidebar */}
+                    <div className="w-80 bg-white border-r border-gray-200 flex flex-col shadow-xl z-10">
+                        <div className="p-4 border-b border-gray-200">
+                            <h1 className="text-xl font-bold text-gray-800 flex items-center gap-2">
+                                <i data-lucide="cpu"></i> QuantEditor
+                            </h1>
+                            <p className="text-xs text-gray-500 mt-1 mb-3">Mode: AIMET (Int Only)</p>
+                            
+                            <div className="flex items-center justify-between text-xs bg-gray-50 p-2 rounded border border-gray-200">
+                                <span className="font-semibold text-gray-600">Global Default:</span>
+                                <div className="flex gap-1">
+                                    {[8, 16, 32].map(bw => (
+                                        <button 
+                                            key={bw}
+                                            onClick={() => setDefaultBitwidth(bw)}
+                                            className={`px-2 py-0.5 rounded border ${
+                                                defaultBitwidth === bw 
+                                                ? 'bg-indigo-600 text-white border-indigo-600' 
+                                                : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-100'
+                                            }`}
+                                        >
+                                            {bw}
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* File Uploads */}
+                        <div className="p-4 space-y-4 bg-gray-50">
+                            <div>
+                                <label className="block text-xs font-semibold text-gray-700 mb-1 flex items-center gap-1">
+                                    <i data-lucide="layers" className="w-3 h-3"></i> Graph Structure (JSON)
+                                </label>
+                                <input type="file" onChange={handleStructureUpload} className="block w-full text-xs text-gray-500 file:mr-2 file:py-1 file:px-2 file:rounded-md file:border-0 file:text-xs file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"/>
+                            </div>
+                            <div>
+                                <label className="block text-xs font-semibold text-gray-700 mb-1 flex items-center gap-1">
+                                    <i data-lucide="upload" className="w-3 h-3"></i> Encodings (JSON)
+                                </label>
+                                <input type="file" onChange={handleEncodingsUpload} className="block w-full text-xs text-gray-500 file:mr-2 file:py-1 file:px-2 file:rounded-md file:border-0 file:text-xs file:font-semibold file:bg-green-50 file:text-green-700 hover:file:bg-green-100"/>
+                            </div>
+                        </div>
+
+                        {/* Stats */}
+                        <div className="p-4 grid grid-cols-3 gap-2 text-center border-b border-gray-200">
+                            <div className="bg-green-100 p-2 rounded">
+                                <div className="text-xs font-bold text-green-800">INT8</div>
+                                <div className="text-lg font-bold text-green-900">{stats.int8}</div>
+                            </div>
+                            <div className="bg-blue-100 p-2 rounded">
+                                <div className="text-xs font-bold text-blue-800">INT16</div>
+                                <div className="text-lg font-bold text-blue-900">{stats.int16}</div>
+                            </div>
+                            <div className="bg-gray-100 p-2 rounded">
+                                <div className="text-xs font-bold text-gray-600">INT32</div>
+                                <div className="text-lg font-bold text-gray-800">{stats.int32}</div>
+                            </div>
+                        </div>
+
+                        {/* Actions */}
+                        <div className="p-4 border-b border-gray-200">
+                            <h3 className="text-xs font-semibold text-gray-500 uppercase mb-2">Selection: {selectedNodes.size}</h3>
+                            <div className="grid grid-cols-3 gap-2 mb-3">
+                                <button onClick={() => applyEncoding(8)} className="px-2 py-1 bg-green-500 hover:bg-green-600 text-white text-xs rounded font-medium">Set INT8</button>
+                                <button onClick={() => applyEncoding(16)} className="px-2 py-1 bg-blue-500 hover:bg-blue-600 text-white text-xs rounded font-medium">Set INT16</button>
+                                <button onClick={() => applyEncoding(32)} className="px-2 py-1 bg-gray-500 hover:bg-gray-600 text-white text-xs rounded font-medium">Set INT32</button>
+                            </div>
+                            <div className="flex gap-2">
+                                <button onClick={() => selectByType('Conv')} className="flex-1 px-2 py-1 border border-gray-300 text-gray-600 text-xs rounded hover:bg-gray-50 flex items-center justify-center gap-1">
+                                    <i data-lucide="mouse-pointer-2" className="w-3 h-3"></i> Convs
+                                </button>
+                                <button onClick={clearSelection} className="flex-1 px-2 py-1 border border-red-200 text-red-600 text-xs rounded hover:bg-red-50">Clear</button>
+                            </div>
+                        </div>
+
+                        {/* List View */}
+                        <div className="flex-1 overflow-auto">
+                            <div className="p-2 sticky top-0 bg-white border-b border-gray-100 flex items-center gap-2">
+                                <i data-lucide="search" className="w-4 h-4 text-gray-400"></i>
+                                <input 
+                                    type="text" 
+                                    placeholder="Filter nodes..." 
+                                    className="w-full px-2 py-1 text-sm border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
+                                    value={searchTerm}
+                                    onChange={e => setSearchTerm(e.target.value)}
+                                />
+                            </div>
+                            <ul className="divide-y divide-gray-100">
+                                {filteredNodes.map(node => {
+                                    return (
+                                    <li 
+                                        key={node.id} 
+                                        onClick={(e) => handleListClick(node.id, e)} 
+                                        className={`group p-2 text-xs cursor-pointer flex justify-between items-center hover:bg-gray-50 ${selectedNodes.has(node.id) ? 'bg-blue-50 border-l-4 border-blue-500' : ''}`}
+                                    >
+                                        <div className="min-w-0 pr-2">
+                                            <div className="font-medium truncate w-36" title={node.id}>{node.id}</div>
+                                            <div className="text-gray-400 text-[10px] uppercase">{node.type}</div>
+                                        </div>
+                                        <div className="flex items-center gap-2">
+                                            <button 
+                                                title="Focus View"
+                                                className="hidden group-hover:block p-1 hover:bg-gray-200 rounded text-gray-500"
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    handleListClick(node.id, e);
+                                                }}
+                                            >
+                                                <i data-lucide="crosshair" className="w-3 h-3"></i>
+                                            </button>
+                                            <span className="text-[9px] text-gray-400">{getEncodingLabel(node.id)}</span>
+                                            <span className={`w-2 h-2 rounded-full ${getEncodingColorClass(node.id)}`}></span>
+                                        </div>
+                                    </li>
+                                )})}
+                            </ul>
+                        </div>
+                        
+                        {/* Footer */}
+                        <div className="p-4 bg-gray-50 border-t border-gray-200">
+                            <button onClick={downloadEncodings} className="w-full py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-bold rounded flex justify-center gap-2 items-center">
+                                <i data-lucide="download" className="w-4 h-4"></i>
+                                <span>Export (AIMET)</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    {/* Main Canvas */}
+                    <div className="flex-1 relative bg-gray-100">
+                        {graphData.nodes.length === 0 ? (
+                            <div className="flex flex-col items-center justify-center h-full text-gray-400">
+                                <i data-lucide="layers" className="w-12 h-12 mb-4 text-gray-300"></i>
+                                <h2 className="text-xl font-medium">No Graph Loaded</h2>
+                                <p className="text-sm mt-1">Upload <code className="bg-gray-200 px-1 rounded text-gray-600">graph_structure.json</code> to start</p>
+                            </div>
+                        ) : (
+                            <GraphVisualizer 
+                                data={graphData} 
+                                encodings={encodings} 
+                                selectedNodes={selectedNodes}
+                                onNodeClick={handleNodeClick}
+                                defaultBitwidth={defaultBitwidth}
+                                focusedNode={focusedNode}
+                            />
+                        )}
+                        
+                        {/* Legend Overlay */}
+                        <div className="absolute top-4 right-4 bg-white/90 backdrop-blur p-3 rounded shadow-lg border border-gray-200 text-xs pointer-events-none select-none">
+                            <div className="font-bold mb-2 text-gray-700">Legend</div>
+                            <div className="flex items-center gap-2 mb-1"><span className="w-3 h-3 rounded-full bg-green-500 border border-white shadow-sm"></span> INT8</div>
+                            <div className="flex items-center gap-2 mb-1"><span className="w-3 h-3 rounded-full bg-blue-500 border border-white shadow-sm"></span> INT16</div>
+                            <div className="flex items-center gap-2 mb-3"><span className="w-3 h-3 rounded-full bg-gray-300 border border-white shadow-sm"></span> INT32</div>
+                            <div className="pt-2 border-t border-gray-200 text-gray-500">
+                                <b>Click</b>: Select<br/>
+                                <b>Shift+Click</b>: Range<br/>
+                                <b>Ctrl+Click</b>: Toggle
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
